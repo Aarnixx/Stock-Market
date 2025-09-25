@@ -15,7 +15,13 @@ btn_2.place(relx=0.15, rely=0.95, anchor="center")
 
 text_input = CTkTextbox(root, width=140, height=25)
 text_input.place(relx=0.15, rely=0.10, anchor="center")
+def autofill(input : str):
+    company_autofill = CTkLabel(root, width=140, height=100)
+    company_autofill.place(relx=0.15, rely=0.55, anchor="center")
+    while input in company_array
+        pass
 
+autofill(text_input.get('1.0', 'end-1c'))
 
 class stock_market:
     def define_stock_market(companies):
@@ -29,3 +35,5 @@ class stock_market:
 if __name__=="__main__":
     stock_market.define_stock_market(300)
     root.mainloop()
+
+
