@@ -1,0 +1,31 @@
+import random
+from customtkinter import * 
+
+characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+company_array = []
+root = CTk()
+root.geometry("600x600")
+root.title("Stock market")
+
+btn_1 = CTkButton(root, text="Buy")
+btn_1.place(relx=0.15, rely=0.9, anchor="center")
+
+btn_2 = CTkButton(root, text="Sell")
+btn_2.place(relx=0.15, rely=0.95, anchor="center")
+
+text_input = CTkTextbox(root, width=140, height=25)
+text_input.place(relx=0.15, rely=0.10, anchor="center")
+
+
+class stock_market:
+    def define_stock_market(companies):
+        for i in range(companies):
+            chosen_name = ''.join(random.choices(characters, k=3))
+            while chosen_name not in company_array:
+                company_array.append(chosen_name)
+                companies =- 1
+        #print(company_array)
+
+if __name__=="__main__":
+    stock_market.define_stock_market(300)
+    root.mainloop()
