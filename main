@@ -23,15 +23,6 @@ text_input.pack(fill="x", padx=10, pady=5)
 suggestion_frame = CTkFrame(left_panel)
 suggestion_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
-btn_frame_buy_sell = CTkFrame(left_panel)
-btn_frame_buy_sell.pack(fill="x", pady=10)
-
-btn_1 = CTkButton(btn_frame_buy_sell, text="Buy")
-btn_1.pack(side="left", expand=True, padx=10)
-
-btn_2 = CTkButton(btn_frame_buy_sell, text="Sell")
-btn_2.pack(side="right", expand=True, padx=10)
-
 MAX_SUGGESTIONS = 10
 suggestion_buttons = [CTkButton(suggestion_frame, text="") for _ in range(MAX_SUGGESTIONS)]
 for idx, btn in enumerate(suggestion_buttons):
@@ -42,6 +33,15 @@ for c in range(2):
     suggestion_frame.grid_columnconfigure(c, weight=1)
 for r in range(5):
     suggestion_frame.grid_rowconfigure(r, weight=1)
+
+btn_frame_buy_sell = CTkFrame(left_panel)
+btn_frame_buy_sell.pack(fill="x", pady=10)
+
+btn_1 = CTkButton(btn_frame_buy_sell, text="Buy")
+btn_1.pack(side="left", expand=True, padx=10)
+
+btn_2 = CTkButton(btn_frame_buy_sell, text="Sell")
+btn_2.pack(side="right", expand=True, padx=10)
 
 stock_labels = []
 selected_company = None
@@ -172,48 +172,71 @@ amount_entry = CTkEntry(center_frame, placeholder_text="Amount")
 amount_entry.pack(fill="x", padx=10, pady=5)
 
 def set_amount(n):
+    try:
+        n_int = int(float(n))
+    except Exception:
+        n_int = 0
+    n_int = max(0, n_int)
     amount_entry.delete(0, "end")
-    amount_entry.insert(0, str(int(max(0, int(n)))))
+    amount_entry.insert(0, str(n_int))
 
 def compute_buy_max_for_selected():
     if not selected_company:
         return 0
     price = companies[selected_company]["stock_price"]
-    return int(player["money"] // price)
+    return int(player["money"] // price) if price > 0 else 0
 
 def compute_sell_max_for_selected():
     if not selected_company:
         return 0
     return player["stocks"].get(selected_company, 0)
 
+def get_amount_from_entry():
+    try:
+        val = int(float(amount_entry.get()))
+    except Exception:
+        val = 0
+    return max(0, val)
+
+def change_amount_by(delta):
+    amt = get_amount_from_entry()
+    new = amt + int(delta)
+    if selected_company:
+        buy_max = compute_buy_max_for_selected()
+        sell_max = compute_sell_max_for_selected()
+        cap = buy_max if buy_max > 0 else sell_max
+        if cap is not None:
+            new = min(new, cap)
+    else:
+        cash_cap = int(player["money"])
+        new = min(new, cash_cap)
+    new = max(0, new)
+    set_amount(new)
+
 def on_btn_min():
-    if not selected_company:
-        set_amount(0)
-        return
-    set_amount(1)
+    set_amount(0)
 
 def on_btn_minus100():
-    if not selected_company:
-        set_amount(0)
-        return
-    buy_max = compute_buy_max_for_selected()
-    sell_max = compute_sell_max_for_selected()
-    target = min(100, max(buy_max, sell_max))
-    set_amount(target)
+    change_amount_by(-100)
 
 def on_btn_plus100():
-    if not selected_company:
-        set_amount(0)
-        return
-    buy_max = compute_buy_max_for_selected()
-    sell_max = compute_sell_max_for_selected()
-    target = min(100, max(buy_max, sell_max))
-    set_amount(target)
+    change_amount_by(100)
 
 def on_btn_max():
     if not selected_company:
+        set_amount(int(player["money"]))
+        return
+
+    comp = companies.get(selected_company)
+    if not comp:
         set_amount(0)
         return
+
+    price = comp["stock_price"]
+    if price <= 0:
+        set_amount(0)
+        return
+
     buy_max = compute_buy_max_for_selected()
     sell_max = compute_sell_max_for_selected()
     if buy_max > 0:
@@ -232,13 +255,6 @@ for i, lab in enumerate(labels):
     b.grid(row=0, column=i, sticky="nsew", padx=3, pady=3)
     small_buttons.append(b)
     btn_frame.grid_columnconfigure(i, weight=1)
-
-def get_amount_from_entry():
-    try:
-        val = int(float(amount_entry.get()))
-    except Exception:
-        val = 0
-    return max(0, val)
 
 def player_buy_action():
     if not selected_company:
@@ -323,10 +339,15 @@ def on_suggestion_click(name):
 
 def update_autofill(event=None):
     user_input = text_input.get("1.0", "end-1c").strip().upper()
-    matches = [n for n in companies if n.startswith(user_input)] if user_input else []
+    if user_input:
+        matches = [n for n in companies if n.startswith(user_input)]
+        items = matches[:MAX_SUGGESTIONS]
+    else:
+        items = list(companies.keys())[:MAX_SUGGESTIONS]
     for i, btn in enumerate(suggestion_buttons):
-        if i < len(matches):
-            btn.configure(text=matches[i], command=lambda s=matches[i]: on_suggestion_click(s))
+        if i < len(items):
+            name = items[i]
+            btn.configure(text=name, command=lambda n=name: on_suggestion_click(n))
         else:
             btn.configure(text="", command=lambda: None)
 
@@ -335,6 +356,7 @@ text_input.bind("<KeyRelease>", update_autofill)
 if __name__ == "__main__":
     define_stock_market(300)
     update_overview()
+    update_autofill()
     update_stock_display()
     update_stock_prices()
     root.mainloop()
