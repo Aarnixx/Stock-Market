@@ -10,7 +10,7 @@ OMINAISUUDET
 - Live-kaaviot kaikille pelaajille ja yksittäisille osakkeille 
 - Omistusten ja P/L:n seuranta 
 
-Tekoäly Pelaajat 
+Tekoäly Pelaajat
 -Tekoäly pelaajat arvioivat koko osakemarkkinoiden tilaa historiaan verrattuna. 
 Jos osake markkinat ovat luultavasti alihinnoiteltu pelaaja ostaa,
 ja jos taas osake on luultavasti yli arvioitu tekoäly myy osakkeensa ja lyhyeksi myy eniten ylihinnoiteltuja osakkeita. 
