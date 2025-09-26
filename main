@@ -1,5 +1,6 @@
 import random
 import numpy as np
+from threading import Timer
 from customtkinter import *
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -8,9 +9,8 @@ characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 companies = {}
 
 root = CTk()
-root.geometry("1200x800")
-root.title("Stock market")
-
+root.geometry("1920x1080")
+root.title("Stock market") 
 left_panel = CTkFrame(root)
 left_panel.pack(side="left", fill="y", padx=5, pady=5)
 
@@ -42,6 +42,9 @@ btn_1.pack(side="left", expand=True, padx=10)
 
 btn_2 = CTkButton(btn_frame_buy_sell, text="Sell")
 btn_2.pack(side="right", expand=True, padx=10)
+
+btn_3 = CTkButton(btn_frame_buy_sell, text="Short")
+btn_3.pack(side="bottom", expand=True, padx=10)
 
 stock_labels = []
 selected_company = None
@@ -90,13 +93,49 @@ for i in range(3):
     ai_money_labels.append(money_lbl)
     ai_profit_labels.append(profit_lbl)
 
-player = {"money": 1000.0, "stocks": {}, "history": [1000.0]}
-ai_players = [{"money": 1000.0, "stocks": {}, "history": [1000.0]} for _ in range(3)]
+owned_frame = CTkFrame(right_panel)
+owned_frame.pack(fill="both", expand=True, padx=10, pady=(10,5))
+
+owned_label = CTkLabel(owned_frame, text="Your Owned Stocks and Short positions", font=("Arial", 14, "bold"))
+owned_label.pack(anchor="w")
+
+owned_stocks_text = CTkTextbox(owned_frame, height=150)
+owned_stocks_text.pack(fill="both", expand=True, pady=5)
+
+player = {"money": 1000.0, "stocks": {}, "history": [1000.0], "shorts": {}}
+ai_players = [{"money": 1000.0, "stocks": {}, "history": [1000.0], "shorts": {}} for _ in range(3)]
+
+def update_owned_display():
+    lines = []
+    lines.append("Owned Stocks:")
+    if player["stocks"]:
+        for stock, qty in player["stocks"].items():
+            price = companies[stock]["stock_price"]
+            total_value = qty * price
+            lines.append(f"  {stock}: {qty} shares (€{total_value:,.2f})")
+    else:
+        lines.append("  None")
+
+    lines.append("\nShort Positions:")
+    if player["shorts"]:
+        for stock, qty in player["shorts"].items():
+            price = companies[stock]["stock_price"]
+            lines.append(f"  {stock}: {qty} shares (current price €{price:,.2f})")
+    else:
+        lines.append("  None")
+
+    text = "\n".join(lines)
+    owned_stocks_text.configure(state="normal")
+    owned_stocks_text.delete("1.0", "end")
+    owned_stocks_text.insert("1.0", text)
+    owned_stocks_text.configure(state="disabled")
+
 
 def generate_stock_price_series(start_price, mu=0.0005, sigma=0.02, days=365):
     shocks = np.random.normal(0, 1, days)
-    prices = start_price * np.exp(np.cumsum((mu - 0.5 * sigma**2) + sigma * shocks))
+    prices = start_price * np.exp(np.cumsum((mu - 0.5 * sigma ** 2) + sigma * shocks))
     return np.maximum(prices, 1.0).tolist()
+
 
 def define_stock_market(num_companies):
     while len(companies) < num_companies:
@@ -107,10 +146,29 @@ def define_stock_market(num_companies):
             companies[name] = {"name": name, "stock_amount": random.randint(1000, 10000),
                                "stock_price": history[-1], "history": history}
 
-def trade(player_obj, company_name, action, qty=1):
+
+def timeout(company_name, player_obj, qty, short_price):
+    current_price = companies[company_name]["stock_price"]
+    profit = (short_price - current_price) * qty
+    player_obj["money"] += short_price * qty
+    player_obj["money"] += profit
+    if company_name in player_obj["shorts"]:
+        player_obj["shorts"][company_name] -= qty
+        if player_obj["shorts"][company_name] <= 0:
+            del player_obj["shorts"][company_name]
+    update_stock_display()
+
+
+def set_timer(time_sec, company_name, player_obj, qty, short_price):
+    timer = Timer(time_sec, timeout, args=(company_name, player_obj, qty, short_price))
+    timer.start()
+
+
+def trade(player_obj, company_name, action, time_of_closing: float, qty=1):
     if company_name not in companies or qty <= 0:
         return 0
     price = companies[company_name]["stock_price"]
+
     if action == "buy":
         max_qty = int(player_obj["money"] // price)
         qty = min(qty, max_qty)
@@ -120,6 +178,21 @@ def trade(player_obj, company_name, action, qty=1):
         player_obj["money"] -= cost
         player_obj["stocks"][company_name] = player_obj["stocks"].get(company_name, 0) + qty
         return qty
+
+    elif action == "short":
+        max_qty = int(player_obj["money"] // price)
+        if max_qty == 0:
+            return 0
+        qty = min(qty, max_qty)
+        if qty <= 0:
+            return 0
+        revenue = qty * price
+        player_obj["money"] += revenue
+        player_obj["shorts"][company_name] = player_obj["shorts"].get(company_name, 0) + qty
+        set_timer(time_of_closing, company_name, player_obj, qty, price)
+
+        return qty
+
     elif action == "sell":
         owned = player_obj["stocks"].get(company_name, 0)
         qty = min(qty, owned)
@@ -131,7 +204,9 @@ def trade(player_obj, company_name, action, qty=1):
         if player_obj["stocks"][company_name] == 0:
             del player_obj["stocks"][company_name]
         return qty
+
     return 0
+
 
 def ai_trade():
     for ai in ai_players:
@@ -149,11 +224,12 @@ def ai_trade():
         portfolio_value = ai["money"] + sum(ai["stocks"].get(n, 0) * companies[n]["stock_price"] for n in ai["stocks"])
         ai["history"].append(portfolio_value)
 
+
 def update_stock_prices():
     mu, sigma = 0.0005, 0.02
     prices = np.array([c['stock_price'] for c in companies.values()])
     shocks = np.random.normal(size=prices.shape)
-    prices = prices * np.exp((mu - 0.5 * sigma**2) + sigma * shocks)
+    prices = prices * np.exp((mu - 0.5 * sigma ** 2) + sigma * shocks)
     for c, p in zip(companies.values(), prices):
         c['stock_price'] = p
         c['history'].append(p)
@@ -165,11 +241,13 @@ def update_stock_prices():
     update_stock_display()
     root.after(1000, update_stock_prices)
 
+
 center_frame = CTkFrame(left_panel)
 center_frame.pack(fill="x", pady=10)
 
 amount_entry = CTkEntry(center_frame, placeholder_text="Amount")
 amount_entry.pack(fill="x", padx=10, pady=5)
+
 
 def set_amount(n):
     try:
@@ -180,16 +258,19 @@ def set_amount(n):
     amount_entry.delete(0, "end")
     amount_entry.insert(0, str(n_int))
 
+
 def compute_buy_max_for_selected():
     if not selected_company:
         return 0
     price = companies[selected_company]["stock_price"]
     return int(player["money"] // price) if price > 0 else 0
 
+
 def compute_sell_max_for_selected():
     if not selected_company:
         return 0
     return player["stocks"].get(selected_company, 0)
+
 
 def get_amount_from_entry():
     try:
@@ -197,6 +278,7 @@ def get_amount_from_entry():
     except Exception:
         val = 0
     return max(0, val)
+
 
 def change_amount_by(delta):
     amt = get_amount_from_entry()
@@ -213,14 +295,18 @@ def change_amount_by(delta):
     new = max(0, new)
     set_amount(new)
 
+
 def on_btn_min():
     set_amount(0)
+
 
 def on_btn_minus100():
     change_amount_by(-100)
 
+
 def on_btn_plus100():
     change_amount_by(100)
+
 
 def on_btn_max():
     if not selected_company:
@@ -244,6 +330,7 @@ def on_btn_max():
     else:
         set_amount(sell_max)
 
+
 btn_frame = CTkFrame(center_frame)
 btn_frame.pack(fill="x", padx=5, pady=5)
 
@@ -256,30 +343,45 @@ for i, lab in enumerate(labels):
     small_buttons.append(b)
     btn_frame.grid_columnconfigure(i, weight=1)
 
+
 def player_buy_action():
     if not selected_company:
         return
     qty = get_amount_from_entry()
-    traded = trade(player, selected_company, "buy", qty)
+    traded = trade(player, selected_company, "buy", 0, qty)
     if traded > 0:
         update_stock_display()
+
 
 def player_sell_action():
     if not selected_company:
         return
     qty = get_amount_from_entry()
-    traded = trade(player, selected_company, "sell", qty)
+    traded = trade(player, selected_company, "sell", 0, qty)
     if traded > 0:
         update_stock_display()
 
+
+def player_short_action():
+    if not selected_company:
+        return
+    qty = get_amount_from_entry()
+    shorted = trade(player, selected_company, "short", 10, qty)
+    if shorted > 0:
+        update_stock_display()
+
+
 btn_1.configure(command=player_buy_action)
 btn_2.configure(command=player_sell_action)
+btn_3.configure(command=player_short_action)
+
 
 def update_stock_display():
     if selected_company:
         comp = companies[selected_company]
         line_stock.set_data(range(len(comp["history"])), comp["history"])
-        ax_stock.relim(); ax_stock.autoscale_view()
+        ax_stock.relim()
+        ax_stock.autoscale_view()
         ax_stock.set_title(f"Stock: {comp['name']}")
         ax_stock.set_xlabel("Days")
         ax_stock.set_ylabel("Price")
@@ -288,12 +390,14 @@ def update_stock_display():
         line_stock.set_data([], [])
         canvas_stock.draw_idle()
     line_player.set_data(range(len(player["history"])), player["history"])
-    player_money_ax.relim(); player_money_ax.autoscale_view()
+    player_money_ax.relim()
+    player_money_ax.autoscale_view()
     player_money_ax.set_title("Player Portfolio (€)", fontsize=8)
     player_money_canvas.draw_idle()
     for i, ai in enumerate(ai_players):
         ai_lines[i].set_data(range(len(ai["history"])), ai["history"])
-        ai_axes[i].relim(); ai_axes[i].autoscale_view()
+        ai_axes[i].relim()
+        ai_axes[i].autoscale_view()
         ai_canvases[i].draw_idle()
         current_money = ai["money"]
         current_value = ai["history"][-1] if ai["history"] else current_money
@@ -301,8 +405,10 @@ def update_stock_display():
         ai_money_labels[i].configure(text=f"AI{i+1} Money: €{current_money:,.2f}")
         ai_profit_labels[i].configure(text=f"AI{i+1} P/L: €{profit:,.2f}")
     update_overview()
+    update_owned_display()
     amt = get_amount_from_entry()
     set_amount(amt)
+
 
 def show_chart(name):
     global selected_company
@@ -310,10 +416,12 @@ def show_chart(name):
     on_btn_max()
     update_stock_display()
 
+
 def show_overview():
     global selected_company
     selected_company = None
     update_stock_display()
+
 
 def update_overview():
     if not stock_labels:
@@ -334,8 +442,10 @@ def update_overview():
         color = "green" if arrow == "▲" else "red"
         lbl.configure(text=f"{name} {arrow}", fg_color=color)
 
+
 def on_suggestion_click(name):
     show_chart(name)
+
 
 def update_autofill(event=None):
     user_input = text_input.get("1.0", "end-1c").strip().upper()
@@ -350,6 +460,7 @@ def update_autofill(event=None):
             btn.configure(text=name, command=lambda n=name: on_suggestion_click(n))
         else:
             btn.configure(text="", command=lambda: None)
+
 
 text_input.bind("<KeyRelease>", update_autofill)
 
