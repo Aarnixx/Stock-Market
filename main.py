@@ -17,12 +17,11 @@ AI_MODEL_DIR = "ai_models"
 SHARED_MODELS_PATH = os.path.join(AI_MODEL_DIR, "shared_models.json")
 os.makedirs(AI_MODEL_DIR, exist_ok=True)
 
-SHORT_MARGIN_RATE = 1.0
+SHORT_MARGIN_RATE = 1.0 # Kuinka paljon rahaa pitää olla lyhytmyyntiä varten 
 
 pg.setConfigOption("background", "#121212")
 pg.setConfigOption("foreground", "#E6E6E6")
 pg.setConfigOptions(antialias=True)
-
 
 class _GUICallData:
     def __init__(self, fn, args, kwargs):
@@ -31,7 +30,6 @@ class _GUICallData:
         self.kwargs = kwargs
         self.reply = None
         self.reply_event = Event()
-
 
 class AITrader:
     ACTIONS = ["buy", "sell", "short", "hold"]
@@ -42,15 +40,14 @@ class AITrader:
         self.reserved = 0.0
         self.stocks = {}
         self.shorts = {}
-        self.history = [money]            # overall value timeline
-        self.money_history = [money]      # cash+reserved timeline
-        self.reserved_history = [0.0]     # reserved (margin) timeline
-        self.stocks_history = [0.0]       # market value of long stocks
-        self.shorts_history = [0.0]       # market cost of shorts
-        self.stock_position_history = [0.0]  # net shares (long - short) for selected company
-        self.alpha = alpha
-        self.gamma = gamma
-        self.epsilon = epsilon
+        self.history = [money]
+        self.money_history = [money]
+        self.reserved_history = [0.0]
+        self.stocks_history = [0.0]
+        self.shorts_history = [0.0]
+        self.alpha = alpha # Oppimisaste(Kuinka nopeasti tekoäly päivitää Q-arvojaan)
+        self.gamma = gamma # Alennustekijä(kuinka paljon tekoäly välitää pitkistä sijoituksista)
+        self.epsilon = epsilon # Etsintäaste(Kuinka usein tekoäly tekee randomin teon)
         self.q_table = {}
         self.last_state = None
         self.last_action = None
@@ -122,11 +119,11 @@ class AITrader:
 class StockMarketApp(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Stock Market Simulator")
-        self.resize(1400, 900)
+        self.setWindowTitle("Stock Market")
+        #self.resize(1400, 900)
+        self.showFullScreen()
 
         self.player = {"money": 1000.0, "reserved": 0.0, "stocks": {}, "history": [1000.0], "shorts": {}}
-        self.player_stockpos_history = [0.0]
         self.player_stocks_history = [0.0]
         self.player_reserved_history = [0.0]
         self.player_overall_history = [self.player["money"] + self.player.get("reserved", 0.0)]
@@ -244,10 +241,9 @@ class StockMarketApp(QtWidgets.QWidget):
         self.stock_curve = self.stock_plot.plot(pen=pg.mkPen('#FFD54F', width=2))
         right_layout.addWidget(self.stock_plot)
 
-        self.player_plot = pg.PlotWidget(title="Player: Net pos (shares), Stocks value (€), Reserved (€), Overall (€)")
+        self.player_plot = pg.PlotWidget(title="Player: Stocks value (€), Reserved (€), Overall (€)")
         self.player_plot.setFixedHeight(220)
         self.player_plot.showGrid(x=True, y=True, alpha=0.25)
-        self.player_stockpos_curve = self.player_plot.plot(pen=pg.mkPen('#4CAF50', width=2))
         self.player_stocks_curve = self.player_plot.plot(pen=pg.mkPen('#2196F3', width=2))
         self.player_reserved_curve = self.player_plot.plot(pen=pg.mkPen('#FF9800', width=2, style=QtCore.Qt.DashLine))
         self.player_overall_curve = self.player_plot.plot(pen=pg.mkPen('#F44336', width=2))
@@ -256,7 +252,6 @@ class StockMarketApp(QtWidgets.QWidget):
             l.setLabelTextColor('#E6E6E6')
         except Exception:
             pass
-        l.addItem(self.player_stockpos_curve, "Net position (shares)")
         l.addItem(self.player_stocks_curve, "Stocks value (€)")
         l.addItem(self.player_reserved_curve, "Reserved (€)")
         l.addItem(self.player_overall_curve, "Overall value (€)")
@@ -270,7 +265,6 @@ class StockMarketApp(QtWidgets.QWidget):
             pw = pg.PlotWidget(title=f"AI {i+1}")
             pw.setFixedHeight(140)
             pw.showGrid(x=True, y=True, alpha=0.18)
-            stockpos_curve = pw.plot(pen=pg.mkPen('#4CAF50', width=2))
             stocks_curve = pw.plot(pen=pg.mkPen('#2196F3', width=2))
             reserved_curve = pw.plot(pen=pg.mkPen('#FF9800', width=2, style=QtCore.Qt.DashLine))
             overall_curve = pw.plot(pen=pg.mkPen('#F44336', width=2))
@@ -279,11 +273,10 @@ class StockMarketApp(QtWidgets.QWidget):
                 legend.setLabelTextColor('#E6E6E6')
             except Exception:
                 pass
-            legend.addItem(stockpos_curve, "Net position")
             legend.addItem(stocks_curve, "Stocks value")
             legend.addItem(reserved_curve, "Reserved")
             legend.addItem(overall_curve, "Overall value")
-            self.ai_curves.append((pw, {"stockpos": stockpos_curve, "stocks": stocks_curve, "reserved": reserved_curve, "overall": overall_curve}))
+            self.ai_curves.append((pw, {"stocks": stocks_curve, "reserved": reserved_curve, "overall": overall_curve}))
             ai_layout.addWidget(pw, i, 0)
         right_layout.addWidget(ai_plots_widget)
 
@@ -310,6 +303,10 @@ class StockMarketApp(QtWidgets.QWidget):
         self.thread.start()
 
         QtWidgets.QApplication.instance().aboutToQuit.connect(self.save_ai_models)
+
+        if not self.selected_company and companies:
+            self.selected_company = next(iter(companies))
+        self.update_charts(record_history=False)
 
     def make_gui_call(self, fn, *args, **kwargs):
         data = _GUICallData(fn, args, kwargs)
@@ -366,7 +363,7 @@ class StockMarketApp(QtWidgets.QWidget):
     def show_chart(self, name):
         if name:
             self.selected_company = name
-            self.update_charts()
+            self.update_charts(record_history=False)
 
     def get_amount(self):
         try:
@@ -570,11 +567,9 @@ class StockMarketApp(QtWidgets.QWidget):
             ai.shorts_history.append(self.entity_shorts_cost(ai))
             ai.money_history.append(self.entity_cash_total(ai))
             ai.reserved_history.append(ai_reserved)
-            net_pos = self.entity_net_position(ai, self.selected_company) if self.selected_company else 0.0
-            ai.stock_position_history.append(net_pos)
 
     def update_stock_prices(self):
-        mu, sigma = 0.0005, 0.02
+        mu, sigma = 0.0005, 0.02 # Keskimääräinen tuotto, Tuottojen Keskihajonta
         for comp in companies.values():
             shock = np.random.normal()
             comp['stock_price'] *= np.exp(mu - 0.5 * sigma ** 2 + sigma * shock)
@@ -584,7 +579,54 @@ class StockMarketApp(QtWidgets.QWidget):
 
         self.check_shorts_expiry()
         self.ai_trade()
-        self.update_charts()
+        self.update_charts(record_history=True)
+
+    def _gather_y_range(self, plot_widget):
+        y_min = None
+        y_max = None
+        try:
+            for item in plot_widget.listDataItems():
+                d = item.getData()
+                if not d:
+                    continue
+                y = d[1]
+                if y is None:
+                    continue
+                arr = np.asarray(y)
+                if arr.size == 0:
+                    continue
+                cur_min = float(np.nanmin(arr))
+                cur_max = float(np.nanmax(arr))
+                y_min = cur_min if y_min is None else min(y_min, cur_min)
+                y_max = cur_max if y_max is None else max(y_max, cur_max)
+        except Exception:
+            pass
+        if y_min is None or y_max is None:
+            y_min, y_max = -1.0, 1.0
+        return y_min, y_max
+
+    def _auto_pan_to_end(self, plot_widget, data_len, window=150, include_zero=True):
+        try:
+            vb = plot_widget.getViewBox()
+            if data_len <= window:
+                x0 = 0
+                x1 = max(1, data_len)
+            else:
+                x0 = data_len - window
+                x1 = data_len
+            vb.setXRange(x0, x1, padding=0)
+            y_min, y_max = self._gather_y_range(plot_widget)
+            if include_zero:
+                y_min = min(y_min, 0.0)
+                y_max = max(y_max, 0.0)
+            span = y_max - y_min
+            pad = span * 0.08 if span > 1e-9 else max(0.5, 0.08 * (abs(y_max) + 1.0))
+            vb.setYRange(y_min - pad, y_max + pad, padding=0)
+        except Exception:
+            try:
+                plot_widget.autoRange()
+            except Exception:
+                pass
 
     def save_ai_models(self):
         combined = {}
@@ -604,53 +646,57 @@ class StockMarketApp(QtWidgets.QWidget):
         if self.selected_company:
             amt = self.get_amount()
             self.trade(self.player, self.selected_company, "buy", amt)
-            self.update_charts()
+            self.update_charts(record_history=False)
 
     def player_sell_action(self):
         if self.selected_company:
             amt = self.get_amount()
             self.trade(self.player, self.selected_company, "sell", amt)
-            self.update_charts()
+            self.update_charts(record_history=False)
 
     def player_short_action(self):
         if self.selected_company:
             amt = self.get_amount()
             self.trade(self.player, self.selected_company, "short", amt)
-            self.update_charts()
+            self.update_charts(record_history=False)
 
-    def update_charts(self):
-        if self.selected_company:
+    def update_charts(self, record_history=False):
+        data = None
+        if self.selected_company and self.selected_company in companies:
             data = companies[self.selected_company]["history"]
-            self.stock_curve.setData(data)
+            self.stock_curve.setData(list(range(len(data))), data)
             self.stock_plot.setTitle(f"Stock: {self.selected_company}  (price €{companies[self.selected_company]['stock_price']:.2f})")
+            self._auto_pan_to_end(self.stock_plot, len(data), window=150, include_zero=True)
         else:
             self.stock_plot.setTitle("")
+            self.stock_curve.setData([], [])
 
-        player_overall = self.calc_portfolio_value(self.player)
-        self.player["history"].append(player_overall)
+        if record_history:
+            player_overall = self.calc_portfolio_value(self.player)
+            self.player["history"].append(player_overall)
 
-        p_net_pos = self.entity_net_position(self.player, self.selected_company) if self.selected_company else 0.0
-        p_stocks_val = self.entity_stocks_value(self.player)
-        p_reserved = self.player.get("reserved", 0.0)
-        p_overall = player_overall
+            p_stocks_val = self.entity_stocks_value(self.player)
+            p_reserved = self.player.get("reserved", 0.0)
+            p_overall = player_overall
 
-        self.player_stockpos_history.append(p_net_pos)
-        self.player_stocks_history.append(p_stocks_val)
-        self.player_reserved_history.append(p_reserved)
-        self.player_overall_history.append(p_overall)
+            self.player_stocks_history.append(p_stocks_val)
+            self.player_reserved_history.append(p_reserved)
+            self.player_overall_history.append(p_overall)
 
-        self.player_plot.setTitle("Player: Net pos (shares), Stocks value (€), Reserved (€), Overall (€)")
-        self.player_stockpos_curve.setData(self.player_stockpos_history)
-        self.player_stocks_curve.setData(self.player_stocks_history)
-        self.player_reserved_curve.setData(self.player_reserved_history)
-        self.player_overall_curve.setData(self.player_overall_history)
+        self.player_plot.setTitle("Player: Stocks value (€), Reserved (€), Overall (€)")
+
+        self.player_stocks_curve.setData(list(range(len(self.player_stocks_history))), self.player_stocks_history)
+        self.player_reserved_curve.setData(list(range(len(self.player_reserved_history))), self.player_reserved_history)
+        self.player_overall_curve.setData(list(range(len(self.player_overall_history))), self.player_overall_history)
 
         for i, (pw, curves) in enumerate(self.ai_curves):
             ai = self.ai_players[i]
-            curves["stockpos"].setData(ai.stock_position_history)
-            curves["stocks"].setData(ai.stocks_history)
-            curves["reserved"].setData(ai.reserved_history)
-            curves["overall"].setData(ai.history)
+            curves["stocks"].setData(list(range(len(ai.stocks_history))), ai.stocks_history)
+            curves["reserved"].setData(list(range(len(ai.reserved_history))), ai.reserved_history)
+            curves["overall"].setData(list(range(len(ai.history))), ai.history)
+            self._auto_pan_to_end(pw, len(ai.history), window=150, include_zero=True)
+
+        self._auto_pan_to_end(self.player_plot, len(self.player_overall_history), window=150, include_zero=True)
 
         while self.holdings_layout.count():
             item = self.holdings_layout.takeAt(0)
