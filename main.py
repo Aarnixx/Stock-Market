@@ -1,547 +1,691 @@
+import sys
+import os
+import json
 import random
 import uuid
 import time
 import numpy as np
-from threading import Timer
-from customtkinter import *
-import matplotlib.pyplot as plt
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from queue import Empty, Queue
+from threading import Event, Thread
+from PyQt5 import QtWidgets, QtCore, QtGui
+import pyqtgraph as pg
 
 characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 companies = {}
 
-root = CTk()
-root.geometry("1920x1080")
-root.title("Stock market")
-left_panel = CTkFrame(root)
-left_panel.pack(side="left", fill="y", padx=5, pady=5)
+AI_MODEL_DIR = "ai_models"
+SHARED_MODELS_PATH = os.path.join(AI_MODEL_DIR, "shared_models.json")
+os.makedirs(AI_MODEL_DIR, exist_ok=True)
 
-overview_frame = CTkFrame(left_panel)
-overview_frame.pack(fill="x", padx=5, pady=5)
+SHORT_MARGIN_RATE = 1.0
 
-text_input = CTkTextbox(left_panel, height=25)
-text_input.pack(fill="x", padx=10, pady=5)
+pg.setConfigOption("background", "#121212")
+pg.setConfigOption("foreground", "#E6E6E6")
+pg.setConfigOptions(antialias=True)
 
-suggestion_frame = CTkFrame(left_panel)
-suggestion_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
-MAX_SUGGESTIONS = 10
-suggestion_buttons = [CTkButton(suggestion_frame, text="") for _ in range(MAX_SUGGESTIONS)]
-for idx, btn in enumerate(suggestion_buttons):
-    row = idx // 2
-    col = idx % 2
-    btn.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
-for c in range(2):
-    suggestion_frame.grid_columnconfigure(c, weight=1)
-for r in range(5):
-    suggestion_frame.grid_rowconfigure(r, weight=1)
+class _GUICallData:
+    def __init__(self, fn, args, kwargs):
+        self.fn = fn
+        self.args = args
+        self.kwargs = kwargs
+        self.reply = None
+        self.reply_event = Event()
 
-btn_frame_buy_sell = CTkFrame(left_panel)
-btn_frame_buy_sell.pack(fill="x", pady=10)
 
-btn_1 = CTkButton(btn_frame_buy_sell, text="Buy")
-btn_1.pack(side="left", expand=True, padx=10)
+class AITrader:
+    ACTIONS = ["buy", "sell", "short", "hold"]
 
-btn_2 = CTkButton(btn_frame_buy_sell, text="Sell")
-btn_2.pack(side="right", expand=True, padx=10)
+    def __init__(self, idx, money=1000.0, alpha=0.1, gamma=0.9, epsilon=0.2):
+        self.idx = idx
+        self.money = money
+        self.reserved = 0.0
+        self.stocks = {}
+        self.shorts = {}
+        self.history = [money]            # overall value timeline
+        self.money_history = [money]      # cash+reserved timeline
+        self.reserved_history = [0.0]     # reserved (margin) timeline
+        self.stocks_history = [0.0]       # market value of long stocks
+        self.shorts_history = [0.0]       # market cost of shorts
+        self.stock_position_history = [0.0]  # net shares (long - short) for selected company
+        self.alpha = alpha
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.q_table = {}
+        self.last_state = None
+        self.last_action = None
+        self.model_path = os.path.join(AI_MODEL_DIR, f"ai_model_{idx}.json")
+        self.load_model()
 
-btn_3 = CTkButton(btn_frame_buy_sell, text="Short")
-btn_3.pack(side="bottom", expand=True, padx=10)
+    def state_for(self, comp):
+        hist = comp["history"]
+        if len(hist) < 5:
+            return "cold|1.00"
+        window = hist[-5:]
+        trend = 1 if window[-1] > window[0] * 1.001 else (-1 if window[-1] < window[0] * 0.999 else 0)
+        ratio = round(window[-1] / (np.mean(window) + 1e-9), 2)
+        return f"{trend}|{ratio:.2f}"
 
-stock_labels = []
-selected_company = None
+    def ensure_state(self, s):
+        if s not in self.q_table:
+            self.q_table[s] = {a: 0.0 for a in self.ACTIONS}
 
-right_panel = CTkFrame(root)
-right_panel.pack(side="right", fill="both", expand=True, padx=5, pady=5)
+    def choose_action(self, state):
+        self.ensure_state(state)
+        if random.random() < self.epsilon:
+            return random.choice(self.ACTIONS)
+        items = list(self.q_table[state].items())
+        maxv = max(v for a, v in items)
+        best = [a for a, v in items if v == maxv]
+        return random.choice(best)
 
-fig_stock, ax_stock = plt.subplots(figsize=(6, 2.0))
-fig_stock.set_constrained_layout(True)
-canvas_stock = FigureCanvasTkAgg(fig_stock, master=right_panel)
-canvas_stock_widget = canvas_stock.get_tk_widget()
-canvas_stock_widget.pack(fill="x", padx=5, pady=5)
-line_stock, = ax_stock.plot([], linewidth=1)
-canvas_stock.draw()
+    def update_q(self, reward, new_state):
+        if self.last_state is None or self.last_action is None:
+            return
+        self.ensure_state(self.last_state)
+        self.ensure_state(new_state)
+        old_q = self.q_table[self.last_state][self.last_action]
+        max_future = max(self.q_table[new_state].values()) if self.q_table[new_state] else 0.0
+        new_q = old_q + self.alpha * (reward + self.gamma * max_future - old_q)
+        self.q_table[self.last_state][self.last_action] = new_q
 
-ai_figs, ai_axes, ai_canvases, ai_lines = [], [], [], []
-ai_money_labels, ai_profit_labels = [], []
-
-for i in range(3):
-    f, a = plt.subplots(figsize=(6, 1.0))
-    f.set_constrained_layout(True)
-    c = FigureCanvasTkAgg(f, master=right_panel)
-    w = c.get_tk_widget()
-    w.pack(fill="x", padx=5, pady=5)
-    line, = a.plot([], linewidth=1)
-    ai_figs.append(f)
-    ai_axes.append(a)
-    ai_canvases.append(c)
-    ai_lines.append(line)
-    c.draw()
-    lbl_frame = CTkFrame(right_panel)
-    lbl_frame.pack(fill="x", padx=10, pady=2)
-    money_lbl = CTkLabel(lbl_frame, text=f"AI{i+1} Money: €0.00", anchor="w")
-    profit_lbl = CTkLabel(lbl_frame, text=f"AI{i+1} P/L: €0.00", anchor="w")
-    money_lbl.pack(side="left", padx=5)
-    profit_lbl.pack(side="right", padx=5)
-    ai_money_labels.append(money_lbl)
-    ai_profit_labels.append(profit_lbl)
-
-player_money_fig, player_money_ax = plt.subplots(figsize=(6, 1.5))
-player_money_fig.set_constrained_layout(True)
-player_money_canvas = FigureCanvasTkAgg(player_money_fig, master=right_panel)
-player_money_canvas_widget = player_money_canvas.get_tk_widget()
-player_money_canvas_widget.pack(fill="x", padx=5, pady=5)
-line_player, = player_money_ax.plot([], linewidth=1)
-player_money_canvas.draw()
-
-player_lbl_frame = CTkFrame(right_panel)
-player_lbl_frame.pack(fill="x", padx=10, pady=2)
-player_money_label = CTkLabel(player_lbl_frame, text=f"Player Money: €{0:,.2f}", anchor="w")
-player_profit_label = CTkLabel(player_lbl_frame, text=f"Player P/L: €{0:,.2f}", anchor="w")
-player_money_label.pack(side="left", padx=5)
-player_profit_label.pack(side="right", padx=5)
-
-owned_frame = CTkFrame(right_panel)
-owned_frame.pack(fill="both", expand=True, padx=10, pady=(10, 5))
-
-owned_label = CTkLabel(owned_frame, text="Your Owned Stocks and Short positions", font=("Arial", 14, "bold"))
-owned_label.pack(anchor="w")
-
-owned_stocks_text = CTkTextbox(owned_frame, height=150)
-owned_stocks_text.pack(fill="both", expand=True, pady=5)
-
-player = {"money": 1000.0, "stocks": {}, "history": [1000.0], "shorts": {}}
-ai_players = [{"money": 1000.0, "stocks": {}, "history": [1000.0], "shorts": {}} for _ in range(3)]
-
-def update_owned_display():
-    to_close = []
-    lines = ["Owned Stocks:"]
-    if player["stocks"]:
-        for stock, qty in player["stocks"].items():
-            price = companies[stock]["stock_price"]
-            total_value = qty * price
-            lines.append(f"  {stock}: {qty} shares (€{total_value:,.2f})")
-    else:
-        lines.append("  None")
-    lines.append("\nShort Positions:")
-    has_shorts = False
-    for stock, positions in list(player["shorts"].items()):
-        for pos in list(positions):
-            elapsed_days = (time.time() - pos["start_time"]) / (24 * 3600)
-            remaining_days = pos["duration_days"] - elapsed_days
-            if remaining_days <= 0.0:
-                to_close.append((pos["id"], stock))
-            else:
-                has_shorts = True
-                price = companies[stock]["stock_price"]
-                lines.append(
-                    f"  {stock} | id:{pos['id'][:8]} qty:{pos['qty']} "
-                    f"short_price:€{pos['short_price']:,.2f} current_price:€{price:,.2f} "
-                    f"remaining_days:{remaining_days:.2f}"
-                )
-    for pos_id, stock in to_close:
-        timeout(pos_id, stock, player, update_ui=False)
-    if to_close:
-        return update_owned_display()
-    if not has_shorts:
-        lines.append("  None")
-    text = "\n".join(lines)
-    owned_stocks_text.configure(state="normal")
-    owned_stocks_text.delete("1.0", "end")
-    owned_stocks_text.insert("1.0", text)
-    owned_stocks_text.configure(state="disabled")
-
-def generate_stock_price_series(start_price, mu=0.0005, sigma=0.02, days=365):
-    shocks = np.random.normal(0, 1, days)
-    prices = start_price * np.exp(np.cumsum((mu - 0.5 * sigma ** 2) + sigma * shocks))
-    return np.maximum(prices, 1.0).tolist()
-
-def define_stock_market(num_companies):
-    while len(companies) < num_companies:
-        name = ''.join(random.choices(characters, k=3))
-        if name not in companies:
-            start_price = random.uniform(50, 200)
-            history = generate_stock_price_series(start_price)
-            companies[name] = {
-                "name": name,
-                "stock_amount": random.randint(1000, 10000),
-                "stock_price": history[-1],
-                "history": history
-            }
-
-def timeout(position_id, company_name, player_obj, update_ui=True):
-    positions = player_obj["shorts"].get(company_name, [])
-    pos = next((p for p in positions if p["id"] == position_id), None)
-    if not pos:
-        return
-    current_price = companies[company_name]["stock_price"]
-    qty = pos["qty"]
-    hist = companies[company_name]["history"]
-    slippage = 0.0
-    if len(hist) >= 6:
-        recent = np.array(hist[-6:])
-        returns = np.diff(np.log(recent + 1e-9))
-        vol = float(np.std(returns[-5:]))
-        slippage = min(0.20, vol * 3.0)
-    if pos.get("duration_days", 0.0) < 1.0:
-        slippage += 0.05
-    buyback_price = current_price * (1.0 + slippage)
-    cost = buyback_price * qty
-    player_obj["money"] -= cost
-    positions.remove(pos)
-    if not positions:
-        del player_obj["shorts"][company_name]
-    if update_ui:
-        update_stock_display()
-
-def set_timer_days(duration_days, position_id, company_name, player_obj):
-    seconds = max(0.0, float(duration_days)) * 24.0 * 3600.0
-    t = Timer(seconds, timeout, args=(position_id, company_name, player_obj))
-    t.daemon = True
-    t.start()
-
-def trade(player_obj, company_name, action, time_of_closing: float, qty=1):
-    if company_name not in companies or qty <= 0:
-        return 0
-    price = companies[company_name]["stock_price"]
-    if action == "buy":
-        max_qty = int(player_obj["money"] // price)
-        qty = min(qty, max_qty)
-        if qty <= 0:
-            return 0
-        player_obj["money"] -= qty * price
-        player_obj["stocks"][company_name] = player_obj["stocks"].get(company_name, 0) + qty
-        return qty
-    elif action == "short":
-        max_qty = int(player_obj["money"] // price)
-        if max_qty == 0:
-            return 0
-        qty = min(qty, max_qty)
-        if qty <= 0:
-            return 0
-        player_obj["money"] += qty * price
-        pos_id = str(uuid.uuid4())
-        position = {
-            "id": pos_id,
-            "qty": qty,
-            "short_price": price,
-            "duration_days": float(time_of_closing),
-            "start_time": time.time()
-        }
-        player_obj["shorts"].setdefault(company_name, []).append(position)
-        set_timer_days(time_of_closing, pos_id, company_name, player_obj)
-        return qty
-    elif action == "sell":
-        owned = player_obj["stocks"].get(company_name, 0)
-        qty = min(qty, owned)
-        if qty <= 0:
-            return 0
-        hist = companies[company_name]["history"]
-        if len(hist) >= 6:
-            recent = np.array(hist[-6:])
-            returns = np.diff(np.log(recent + 1e-9))
-            vol = float(np.std(returns[-5:]))
-            slippage = min(0.20, vol * 2.5)
-        else:
-            slippage = 0.0
-        market_amount = companies[company_name].get("stock_amount", 1000)
-        pressure = qty / max(1.0, market_amount)
-        pressure_slippage = min(0.10, pressure * 2.0)
-        total_slippage = min(0.35, slippage + pressure_slippage)
-        realized_price = price * (1.0 - total_slippage)
-        revenue = qty * realized_price
-        player_obj["money"] += revenue
-        player_obj["stocks"][company_name] = owned - qty
-        if player_obj["stocks"][company_name] == 0:
-            del player_obj["stocks"][company_name]
-        return qty
-    return 0
-
-def ai_trade():
-    for ai in ai_players:
-        for name, comp in companies.items():
-            hist = comp["history"]
-            if len(hist) < 10:
-                continue
-            mean_price = np.mean(hist[-10:])
-            current_price = comp["stock_price"]
-            rnd = random.random()
-            if current_price < mean_price * 0.98 and rnd > 0.25:
-                trade(ai, name, "buy", 1)
-            elif current_price > mean_price * 1.02 and rnd > 0.25:
-                trade(ai, name, "sell", 1)
-        portfolio_value = ai["money"] + sum(
-            ai["stocks"].get(n, 0) * companies[n]["stock_price"] for n in ai["stocks"]
-        )
-        ai["history"].append(portfolio_value)
-
-def update_stock_prices():
-    mu, sigma = 0.0005, 0.02
-    prices = np.array([c['stock_price'] for c in companies.values()])
-    shocks = np.random.normal(size=prices.shape)
-    prices = prices * np.exp((mu - 0.5 * sigma ** 2) + sigma * shocks)
-    for c, p in zip(companies.values(), prices):
-        c['stock_price'] = p
-        c['history'].append(p)
-        if len(c['history']) > 365:
-            c['history'].pop(0)
-    player_value = player["money"] + sum(
-        player["stocks"].get(n, 0) * companies[n]["stock_price"] for n in player["stocks"]
-    )
-    player["history"].append(player_value)
-    ai_trade()
-    update_stock_display()
-    root.after(1000, update_stock_prices)
-
-center_frame = CTkFrame(left_panel)
-center_frame.pack(fill="x", pady=10)
-
-amount_entry = CTkEntry(center_frame, placeholder_text="Amount")
-amount_entry.pack(fill="x", padx=10, pady=5)
-
-def set_amount(n):
-    try:
-        n_int = int(float(n))
-    except Exception:
-        n_int = 0
-    n_int = max(0, n_int)
-    amount_entry.delete(0, "end")
-    amount_entry.insert(0, str(n_int))
-
-def compute_buy_max_for_selected():
-    if not selected_company:
-        return 0
-    price = companies[selected_company]["stock_price"]
-    return int(player["money"] // price) if price > 0 else 0
-
-def compute_sell_max_for_selected():
-    if not selected_company:
-        return 0
-    return player["stocks"].get(selected_company, 0)
-
-def get_amount_from_entry():
-    try:
-        val = int(float(amount_entry.get()))
-    except Exception:
-        val = 0
-    return max(0, val)
-
-def change_amount_by(delta):
-    amt = get_amount_from_entry()
-    new = amt + int(delta)
-    if selected_company:
-        buy_max = compute_buy_max_for_selected()
-        sell_max = compute_sell_max_for_selected()
-        cap = buy_max if buy_max > 0 else sell_max
-        new = min(new, cap)
-    else:
-        cash_cap = int(player["money"])
-        new = min(new, cash_cap)
-    new = max(0, new)
-    set_amount(new)
-
-def on_btn_min():
-    set_amount(0)
-
-def on_btn_minus100():
-    change_amount_by(-100)
-
-def on_btn_plus100():
-    change_amount_by(100)
-
-def on_btn_max():
-    if not selected_company:
-        set_amount(int(player["money"]))
-        return
-    comp = companies.get(selected_company)
-    if not comp:
-        set_amount(0)
-        return
-    price = comp["stock_price"]
-    if price <= 0:
-        set_amount(0)
-        return
-    buy_max = compute_buy_max_for_selected()
-    sell_max = compute_sell_max_for_selected()
-    if buy_max > 0:
-        set_amount(buy_max)
-    else:
-        set_amount(sell_max)
-
-btn_frame = CTkFrame(center_frame)
-btn_frame.pack(fill="x", padx=5, pady=5)
-
-labels = ["min", "-100", "+100", "max"]
-commands = [on_btn_min, on_btn_minus100, on_btn_plus100, on_btn_max]
-for i, lab in enumerate(labels):
-    b = CTkButton(btn_frame, text=lab, command=commands[i])
-    b.grid(row=0, column=i, sticky="nsew", padx=3, pady=3)
-    btn_frame.grid_columnconfigure(i, weight=1)
-
-def player_buy_action():
-    if not selected_company:
-        return
-    qty = get_amount_from_entry()
-    traded = trade(player, selected_company, "buy", 0, qty)
-    if traded > 0:
-        update_stock_display()
-
-def player_sell_action():
-    if not selected_company:
-        return
-    qty = get_amount_from_entry()
-    traded = trade(player, selected_company, "sell", 0, qty)
-    if traded > 0:
-        update_stock_display()
-
-def player_short_action():
-    if not selected_company:
-        return
-    qty = get_amount_from_entry()
-    shorted = trade(player, selected_company, "short", 10, qty)
-    if shorted > 0:
-        update_stock_display()
-
-btn_1.configure(command=player_buy_action)
-btn_2.configure(command=player_sell_action)
-btn_3.configure(command=player_short_action)
-
-def update_stock_display():
-    if selected_company:
-        comp = companies[selected_company]
-        line_stock.set_data(range(len(comp["history"])), comp["history"])
-        ax_stock.relim()
-        ax_stock.autoscale_view()
-        ax_stock.set_title(f"Stock: {comp['name']}", fontsize=8)
-        ax_stock.tick_params(labelsize=6)
+    def save_model(self):
         try:
-            fig_stock.tight_layout()
+            with open(self.model_path, "w") as f:
+                json.dump(self.q_table, f)
+        except Exception as e:
+            print("Failed saving AI model:", e)
+
+    def load_model(self):
+        try:
+            if os.path.exists(SHARED_MODELS_PATH):
+                with open(SHARED_MODELS_PATH, "r") as f:
+                    shared = json.load(f)
+                key = str(self.idx)
+                if key in shared:
+                    self.q_table = shared[key]
+                    for s in list(self.q_table.keys()):
+                        for a in self.ACTIONS:
+                            self.q_table[s].setdefault(a, 0.0)
+                    return
+            if os.path.exists(self.model_path):
+                with open(self.model_path, "r") as f:
+                    self.q_table = json.load(f)
+                for s in list(self.q_table.keys()):
+                    for a in self.ACTIONS:
+                        self.q_table[s].setdefault(a, 0.0)
+        except Exception as e:
+            print("Failed loading AI model:", e)
+            self.q_table = {}
+
+
+class StockMarketApp(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Stock Market Simulator")
+        self.resize(1400, 900)
+
+        self.player = {"money": 1000.0, "reserved": 0.0, "stocks": {}, "history": [1000.0], "shorts": {}}
+        self.player_stockpos_history = [0.0]
+        self.player_stocks_history = [0.0]
+        self.player_reserved_history = [0.0]
+        self.player_overall_history = [self.player["money"] + self.player.get("reserved", 0.0)]
+
+        self.ai_players = [AITrader(i) for i in range(3)]
+        self.selected_company = None
+
+        app = QtWidgets.QApplication.instance()
+        if app:
+            app.setStyle("Fusion")
+            dark_palette = QtGui.QPalette()
+            dark_palette.setColor(QtGui.QPalette.Window, QtGui.QColor(18, 18, 18))
+            dark_palette.setColor(QtGui.QPalette.WindowText, QtGui.QColor(230, 230, 230))
+            dark_palette.setColor(QtGui.QPalette.Base, QtGui.QColor(30, 30, 30))
+            dark_palette.setColor(QtGui.QPalette.AlternateBase, QtGui.QColor(24, 24, 24))
+            dark_palette.setColor(QtGui.QPalette.ToolTipBase, QtGui.QColor(230, 230, 230))
+            dark_palette.setColor(QtGui.QPalette.ToolTipText, QtGui.QColor(230, 230, 230))
+            dark_palette.setColor(QtGui.QPalette.Text, QtGui.QColor(230, 230, 230))
+            dark_palette.setColor(QtGui.QPalette.Button, QtGui.QColor(40, 40, 40))
+            dark_palette.setColor(QtGui.QPalette.ButtonText, QtGui.QColor(230, 230, 230))
+            dark_palette.setColor(QtGui.QPalette.Highlight, QtGui.QColor(60, 120, 180))
+            dark_palette.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor(0, 0, 0))
+            app.setPalette(dark_palette)
+
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        main_layout = QtWidgets.QHBoxLayout(self)
+        main_layout.addWidget(splitter)
+
+        left_widget = QtWidgets.QWidget()
+        left_layout = QtWidgets.QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(12, 12, 12, 12)
+        left_layout.setSpacing(8)
+
+        controls_box = QtWidgets.QGroupBox("Trade Controls")
+        controls_layout = QtWidgets.QVBoxLayout(controls_box)
+        controls_layout.setSpacing(8)
+
+        self.text_input = QtWidgets.QLineEdit()
+        self.text_input.setPlaceholderText("Search stock (or click suggestion)")
+        self.text_input.textChanged.connect(self.update_autofill)
+        controls_layout.addWidget(self.text_input)
+
+        suggestions_layout = QtWidgets.QGridLayout()
+        suggestions_layout.setSpacing(6)
+        self.suggestion_buttons = []
+        for i in range(10):
+            btn = QtWidgets.QPushButton("")
+            btn.setFixedHeight(28)
+            btn.clicked.connect(lambda checked, b=btn: self.show_chart(b.text()))
+            self.suggestion_buttons.append(btn)
+            r, c = divmod(i, 2)
+            suggestions_layout.addWidget(btn, r, c)
+        controls_layout.addLayout(suggestions_layout)
+
+        amt_layout = QtWidgets.QHBoxLayout()
+        self.amount_entry = QtWidgets.QLineEdit("0")
+        validator = QtGui.QDoubleValidator(0.0, 1e12, 2)
+        validator.setNotation(QtGui.QDoubleValidator.StandardNotation)
+        self.amount_entry.setValidator(validator)
+        self.amount_entry.setFixedHeight(30)
+        amt_layout.addWidget(QtWidgets.QLabel("Amount (€):"))
+        amt_layout.addWidget(self.amount_entry)
+        controls_layout.addLayout(amt_layout)
+
+        trade_btn_layout = QtWidgets.QHBoxLayout()
+        self.buy_btn = QtWidgets.QPushButton("Buy")
+        self.sell_btn = QtWidgets.QPushButton("Sell")
+        self.short_btn = QtWidgets.QPushButton("Short")
+        for b in (self.buy_btn, self.sell_btn, self.short_btn):
+            b.setFixedHeight(34)
+        self.buy_btn.clicked.connect(self.player_buy_action)
+        self.sell_btn.clicked.connect(self.player_sell_action)
+        self.short_btn.clicked.connect(self.player_short_action)
+        trade_btn_layout.addWidget(self.buy_btn)
+        trade_btn_layout.addWidget(self.sell_btn)
+        trade_btn_layout.addWidget(self.short_btn)
+        controls_layout.addLayout(trade_btn_layout)
+
+        left_layout.addWidget(controls_box)
+
+        portfolio_box = QtWidgets.QGroupBox("Your Portfolio")
+        portfolio_layout = QtWidgets.QVBoxLayout(portfolio_box)
+        portfolio_layout.setSpacing(6)
+
+        self.holdings_layout = QtWidgets.QVBoxLayout()
+        self.holdings_layout.setSpacing(4)
+        portfolio_layout.addLayout(self.holdings_layout)
+
+        audit_layout = QtWidgets.QFormLayout()
+        self.cash_label = QtWidgets.QLabel()
+        self.reserved_label = QtWidgets.QLabel()
+        audit_layout.addRow("Cash total:", self.cash_label)
+        audit_layout.addRow("Reserved:", self.reserved_label)
+        portfolio_layout.addLayout(audit_layout)
+
+        left_layout.addWidget(portfolio_box)
+        left_layout.addStretch(1)
+
+        left_widget.setStyleSheet("""
+            QGroupBox { font-weight: 600; border: 1px solid #2c2c2c; border-radius: 6px; padding: 8px; color: #E6E6E6;}
+            QPushButton { background: #1f1f1f; border: 1px solid #333; border-radius: 4px; color: #E6E6E6; }
+            QPushButton:pressed { background: #151515; }
+            QLabel { color: #E6E6E6; }
+            QLineEdit { background: #1e1e1e; color: #E6E6E6; border: 1px solid #333; padding: 4px; }
+        """)
+
+        right_widget = QtWidgets.QWidget()
+        right_layout = QtWidgets.QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(8, 8, 8, 8)
+        right_layout.setSpacing(10)
+
+        self.stock_plot = pg.PlotWidget(title="")
+        self.stock_plot.setFixedHeight(220)
+        self.stock_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.stock_curve = self.stock_plot.plot(pen=pg.mkPen('#FFD54F', width=2))
+        right_layout.addWidget(self.stock_plot)
+
+        self.player_plot = pg.PlotWidget(title="Player: Net pos (shares), Stocks value (€), Reserved (€), Overall (€)")
+        self.player_plot.setFixedHeight(220)
+        self.player_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.player_stockpos_curve = self.player_plot.plot(pen=pg.mkPen('#4CAF50', width=2))
+        self.player_stocks_curve = self.player_plot.plot(pen=pg.mkPen('#2196F3', width=2))
+        self.player_reserved_curve = self.player_plot.plot(pen=pg.mkPen('#FF9800', width=2, style=QtCore.Qt.DashLine))
+        self.player_overall_curve = self.player_plot.plot(pen=pg.mkPen('#F44336', width=2))
+        l = self.player_plot.addLegend(offset=(10, 10))
+        try:
+            l.setLabelTextColor('#E6E6E6')
         except Exception:
             pass
-        canvas_stock.draw_idle()
-    else:
-        line_stock.set_data([], [])
-        canvas_stock.draw_idle()
-    line_player.set_data(range(len(player["history"])), player["history"])
-    player_money_ax.relim()
-    player_money_ax.autoscale_view()
-    player_money_ax.set_title("Player Portfolio (€)", fontsize=8)
-    player_money_ax.tick_params(labelsize=6)
-    try:
-        player_money_fig.tight_layout()
-    except Exception:
-        pass
-    player_money_canvas.draw_idle()
-    for i, ai in enumerate(ai_players):
-        if i < len(ai_lines):
-            ai_lines[i].set_data(range(len(ai["history"])), ai["history"])
-            ai_axes[i].relim()
-            ai_axes[i].autoscale_view()
-            ai_axes[i].set_title(f"AI{i+1}", fontsize=6)
-            ai_axes[i].tick_params(labelsize=6)
+        l.addItem(self.player_stockpos_curve, "Net position (shares)")
+        l.addItem(self.player_stocks_curve, "Stocks value (€)")
+        l.addItem(self.player_reserved_curve, "Reserved (€)")
+        l.addItem(self.player_overall_curve, "Overall value (€)")
+        right_layout.addWidget(self.player_plot)
+
+        ai_plots_widget = QtWidgets.QWidget()
+        ai_layout = QtWidgets.QGridLayout(ai_plots_widget)
+        ai_layout.setSpacing(6)
+        self.ai_curves = []
+        for i in range(3):
+            pw = pg.PlotWidget(title=f"AI {i+1}")
+            pw.setFixedHeight(140)
+            pw.showGrid(x=True, y=True, alpha=0.18)
+            stockpos_curve = pw.plot(pen=pg.mkPen('#4CAF50', width=2))
+            stocks_curve = pw.plot(pen=pg.mkPen('#2196F3', width=2))
+            reserved_curve = pw.plot(pen=pg.mkPen('#FF9800', width=2, style=QtCore.Qt.DashLine))
+            overall_curve = pw.plot(pen=pg.mkPen('#F44336', width=2))
+            legend = pw.addLegend(offset=(10, 10))
             try:
-                ai_figs[i].tight_layout()
+                legend.setLabelTextColor('#E6E6E6')
             except Exception:
                 pass
-            ai_canvases[i].draw_idle()
-        current_money = ai["money"]
-        current_value = ai["history"][-1] if ai["history"] else current_money
-        profit = current_value - 1000.0
-        if i < len(ai_money_labels):
-            ai_money_labels[i].configure(text=f"AI{i+1} Money: €{current_money:,.2f}")
-            ai_profit_labels[i].configure(text=f"AI{i+1} P/L: €{profit:,.2f}")
+            legend.addItem(stockpos_curve, "Net position")
+            legend.addItem(stocks_curve, "Stocks value")
+            legend.addItem(reserved_curve, "Reserved")
+            legend.addItem(overall_curve, "Overall value")
+            self.ai_curves.append((pw, {"stockpos": stockpos_curve, "stocks": stocks_curve, "reserved": reserved_curve, "overall": overall_curve}))
+            ai_layout.addWidget(pw, i, 0)
+        right_layout.addWidget(ai_plots_widget)
 
-    line_player.set_data(range(len(player["history"])), player["history"])
-    player_money_ax.relim()
-    player_money_ax.autoscale_view()
-    player_money_ax.set_title("Player Portfolio (€)", fontsize=8)
-    player_money_ax.tick_params(labelsize=6)
-    try:
-        player_money_fig.tight_layout()
-    except Exception:
-        pass
-    player_money_canvas.draw_idle()
+        right_widget.setStyleSheet("QWidget { font-family: Arial; color: #E6E6E6 }")
 
-    player_current_money = player["money"]
-    player_current_value = player["history"][-1] if player["history"] else player_current_money
-    player_profit = player_current_value - 1000.0
-    player_money_label.configure(text=f"Player Money: €{player_current_money:,.2f}")
-    player_profit_label.configure(text=f"Player P/L: €{player_profit:,.2f}")
+        splitter.addWidget(left_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([360, 1040])
+        splitter.setStretchFactor(1, 1)
 
-    update_overview()
-    update_owned_display()
-    amt = get_amount_from_entry()
-    set_amount(amt)
+        self.define_stock_market(50)
+        self.update_autofill()
 
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_stock_prices)
+        self.timer.start(1000)
 
-def show_chart(name):
-    global selected_company
-    selected_company = name
-    on_btn_max()
-    update_stock_display()
+        self.save_timer = QtCore.QTimer()
+        self.save_timer.timeout.connect(self.save_ai_models)
+        self.save_timer.start(15000)
 
+        self.call_queue = Queue()
+        self.thread = Thread(target=self.threadFn, daemon=True)
+        self.thread.start()
 
-def show_overview():
-    global selected_company
-    selected_company = None
-    update_stock_display()
+        QtWidgets.QApplication.instance().aboutToQuit.connect(self.save_ai_models)
 
+    def make_gui_call(self, fn, *args, **kwargs):
+        data = _GUICallData(fn, args, kwargs)
+        self.call_queue.put(data)
+        QtCore.QTimer.singleShot(0, self.gui_call_handler)
+        data.reply_event.wait()
+        return data.reply
 
-def update_overview():
-    if not stock_labels:
-        top10 = list(companies.keys())[:10]
-        columns = 2
-        for idx, name in enumerate(top10):
-            lbl = CTkButton(
-                overview_frame,
-                text=name,
-                command=lambda n=name: show_chart(n)
-            )
-            row = idx // columns
-            col = idx % columns
-            lbl.grid(row=row, column=col, padx=5, pady=5, sticky="nsew")
-            stock_labels.append(lbl)
-        for c in range(columns):
-            overview_frame.grid_columnconfigure(c, weight=1)
+    def gui_call_handler(self):
+        try:
+            while True:
+                data = self.call_queue.get_nowait()
+                try:
+                    data.reply = data.fn(*data.args, **data.kwargs)
+                except Exception as e:
+                    data.reply = e
+                finally:
+                    data.reply_event.set()
+        except Empty:
+            pass
 
-    for lbl in stock_labels:
-        name = lbl.cget("text").split()[0]
-        comp = companies[name]
-        if len(comp["history"]) >= 2:
-            arrow = "▲" if comp["history"][-1] >= comp["history"][-2] else "▼"
-        else:
-            arrow = ""
-        color = "green" if arrow == "▲" else "red"
-        lbl.configure(text=f"{name} {arrow}", fg_color=color)
+    def threadFn(self):
+        result = self.make_gui_call(self.get_entry_text)
+        print("Thread read entry text (via make_gui_call):", result)
 
+    def get_entry_text(self):
+        return self.text_input.text()
 
-def on_suggestion_click(name):
-    show_chart(name)
+    def set_entry_text(self, text):
+        self.text_input.setText(text)
 
+    def generate_stock_price_series(self, start_price, mu=0.0005, sigma=0.02, days=365):
+        shocks = np.random.normal(0, 1, days)
+        prices = start_price * np.exp(np.cumsum((mu - 0.5 * sigma ** 2) + sigma * shocks))
+        return np.maximum(prices, 1.0).tolist()
 
-def update_autofill(event=None):
-    user_input = text_input.get("1.0", "end-1c").strip().upper()
-    if user_input:
+    def define_stock_market(self, num_companies):
+        while len(companies) < num_companies:
+            name = ''.join(random.choices(characters, k=3))
+            if name not in companies:
+                start_price = random.uniform(50, 200)
+                history = self.generate_stock_price_series(start_price)
+                companies[name] = {"name": name, "stock_price": history[-1], "history": history}
+
+    def update_autofill(self):
+        user_input = self.text_input.text().strip().upper()
         matches = [n for n in companies if n.startswith(user_input)]
-        items = matches[:MAX_SUGGESTIONS]
-    else:
-        items = list(companies.keys())[:MAX_SUGGESTIONS]
+        items = matches[:10] if matches else list(companies.keys())[:10]
+        for btn, name in zip(self.suggestion_buttons, items):
+            btn.setText(name)
+        for btn in self.suggestion_buttons[len(items):]:
+            btn.setText("")
 
-    for i, btn in enumerate(suggestion_buttons):
-        if i < len(items):
-            name = items[i]
-            btn.configure(text=name, command=lambda n=name: on_suggestion_click(n))
+    def show_chart(self, name):
+        if name:
+            self.selected_company = name
+            self.update_charts()
+
+    def get_amount(self):
+        try:
+            val = float(self.amount_entry.text())
+        except Exception:
+            val = 0.0
+        return max(0.0, val)
+
+    def _get_field(self, entity, field):
+        if isinstance(entity, AITrader):
+            return getattr(entity, field)
+        return entity[field]
+
+    def _set_field(self, entity, field, value):
+        if isinstance(entity, AITrader):
+            setattr(entity, field, value)
         else:
-            btn.configure(text="", command=lambda: None)
+            entity[field] = value
 
+    def entity_stocks_value(self, entity):
+        stocks = self._get_field(entity, "stocks")
+        return sum(qty * companies[n]["stock_price"] for n, qty in stocks.items())
 
-text_input.bind("<KeyRelease>", update_autofill)
+    def entity_shorts_cost(self, entity):
+        shorts = self._get_field(entity, "shorts")
+        total_cost = 0.0
+        for name, positions in shorts.items():
+            for pos in positions:
+                total_cost += pos.get("qty", 0.0) * companies[name]["stock_price"]
+        return total_cost
+
+    def entity_cash_total(self, entity):
+        money = self._get_field(entity, "money")
+        reserved = self._get_field(entity, "reserved") if "reserved" in (entity if isinstance(entity, dict) else vars(entity)) else 0.0
+        return money + reserved
+
+    def entity_net_position(self, entity, company_name):
+        long_qty = self._get_field(entity, "stocks").get(company_name, 0.0)
+        short_qty = 0.0
+        for pos in self._get_field(entity, "shorts").get(company_name, []):
+            short_qty += pos.get("qty", 0.0)
+        return long_qty - short_qty
+
+    def trade(self, player_obj, company_name, action, amount_eur):
+        if company_name not in companies or amount_eur <= 0.0:
+            return
+        price = companies[company_name]["stock_price"]
+
+        money = self._get_field(player_obj, "money")
+        reserved = self._get_field(player_obj, "reserved") if "reserved" in (player_obj if isinstance(player_obj, dict) else vars(player_obj)) else 0.0
+        stocks = self._get_field(player_obj, "stocks")
+        shorts = self._get_field(player_obj, "shorts")
+
+        if action == "sell":
+            owned = stocks.get(company_name, 0.0)
+            sell_qty = min(owned, amount_eur / price)
+            if sell_qty > 0:
+                money += sell_qty * price
+                new_owned = owned - sell_qty
+                if new_owned <= 1e-12:
+                    stocks.pop(company_name, None)
+                else:
+                    stocks[company_name] = new_owned
+            self._set_field(player_obj, "money", money)
+            try:
+                self._set_field(player_obj, "reserved", reserved)
+            except Exception:
+                pass
+            self._set_field(player_obj, "stocks", stocks)
+            self._set_field(player_obj, "shorts", shorts)
+            return
+
+        max_allowed_proceeds = money / SHORT_MARGIN_RATE if SHORT_MARGIN_RATE > 0 else amount_eur
+        use_amount = min(amount_eur, max_allowed_proceeds)
+        if use_amount <= 0:
+            self._set_field(player_obj, "money", money)
+            self._set_field(player_obj, "reserved", reserved)
+            self._set_field(player_obj, "stocks", stocks)
+            self._set_field(player_obj, "shorts", shorts)
+            return
+
+        qty = use_amount / price
+
+        if action == "buy":
+            buy_amt = min(use_amount, money)
+            buy_qty = buy_amt / price
+            money -= buy_amt
+            stocks[company_name] = stocks.get(company_name, 0.0) + buy_qty
+
+        elif action == "short":
+            proceeds = use_amount
+            margin_required = proceeds * SHORT_MARGIN_RATE
+            if money + 1e-12 < margin_required:
+                proceeds = money / SHORT_MARGIN_RATE if SHORT_MARGIN_RATE > 0 else 0.0
+                qty = proceeds / price
+                margin_required = proceeds * SHORT_MARGIN_RATE
+            if proceeds <= 0:
+                self._set_field(player_obj, "money", money)
+                self._set_field(player_obj, "reserved", reserved)
+                return
+            money += proceeds
+            money -= margin_required
+            reserved += margin_required
+            pos_id = str(uuid.uuid4())
+            shorts.setdefault(company_name, []).append({
+                "id": pos_id,
+                "qty": qty,
+                "entry_price": price,
+                "duration_days": 10,
+                "start_time": time.time(),
+                "proceeds": proceeds,
+                "reserved": margin_required
+            })
+
+        self._set_field(player_obj, "money", money)
+        try:
+            self._set_field(player_obj, "reserved", reserved)
+        except Exception:
+            pass
+        self._set_field(player_obj, "stocks", stocks)
+        self._set_field(player_obj, "shorts", shorts)
+
+    def check_shorts_expiry(self):
+        now = time.time()
+        self._check_entity_shorts(self.player, now)
+        for ai in self.ai_players:
+            self._check_entity_shorts(ai, now)
+
+    def _check_entity_shorts(self, entity, now):
+        shorts = self._get_field(entity, "shorts")
+        money = self._get_field(entity, "money")
+        reserved = self._get_field(entity, "reserved") if "reserved" in (entity if isinstance(entity, dict) else vars(entity)) else 0.0
+        updated_shorts = {}
+        for name, positions in list(shorts.items()):
+            still_open = []
+            for pos in positions:
+                elapsed_days = (now - pos["start_time"]) / 1.0
+                if elapsed_days >= pos["duration_days"]:
+                    current_price = companies[name]["stock_price"]
+                    buy_cost = pos["qty"] * current_price
+                    proceeds = pos.get("proceeds", 0.0)
+                    reserved_amt = pos.get("reserved", 0.0)
+                    realized_pnl = proceeds - buy_cost
+                    money -= buy_cost
+                    money += reserved_amt
+                    reserved -= reserved_amt
+                    owner = "Player" if entity is self.player else f"AI{entity.idx+1}"
+                    print(f"{owner} closed short on {name}: P/L {realized_pnl:.2f} (proceeds {proceeds:.2f}, buy_cost {buy_cost:.2f})")
+                else:
+                    still_open.append(pos)
+            if still_open:
+                updated_shorts[name] = still_open
+        self._set_field(entity, "shorts", updated_shorts)
+        self._set_field(entity, "money", money)
+        try:
+            self._set_field(entity, "reserved", reserved)
+        except Exception:
+            pass
+
+    def calc_portfolio_value(self, entity):
+        money = self._get_field(entity, "money")
+        reserved = self._get_field(entity, "reserved") if "reserved" in (entity if isinstance(entity, dict) else vars(entity)) else 0.0
+        stocks = self._get_field(entity, "stocks")
+        shorts = self._get_field(entity, "shorts")
+        value = money + reserved
+        value += sum(stocks.get(n, 0.0) * companies[n]["stock_price"] for n in stocks)
+        value += sum((pos["entry_price"] - companies[name]["stock_price"]) * pos["qty"]
+                     for name, positions in shorts.items() for pos in positions)
+        return value
+
+    def ai_trade(self):
+        for ai in self.ai_players:
+            for name, comp in companies.items():
+                state = ai.state_for(comp)
+                action = ai.choose_action(state)
+                prev_val = self.calc_portfolio_value(ai)
+
+                if action == "buy":
+                    amt = ai.money * 0.10
+                    self.trade(ai, name, "buy", amt)
+                elif action == "sell":
+                    owned_qty = ai.stocks.get(name, 0.0)
+                    if owned_qty > 1e-9:
+                        amt = owned_qty * comp["stock_price"] * 0.5
+                        self.trade(ai, name, "sell", amt)
+                elif action == "short":
+                    amt = ai.money * 0.10
+                    self.trade(ai, name, "short", amt)
+
+                new_val = self.calc_portfolio_value(ai)
+                reward = new_val - prev_val
+                ai.update_q(reward, state)
+                ai.last_state = state
+                ai.last_action = action
+
+            ai_total = self.calc_portfolio_value(ai)
+            ai_stocks_val = self.entity_stocks_value(ai)
+            ai_reserved = ai.reserved
+            ai.history.append(ai_total)
+            ai.stocks_history.append(ai_stocks_val)
+            ai.shorts_history.append(self.entity_shorts_cost(ai))
+            ai.money_history.append(self.entity_cash_total(ai))
+            ai.reserved_history.append(ai_reserved)
+            net_pos = self.entity_net_position(ai, self.selected_company) if self.selected_company else 0.0
+            ai.stock_position_history.append(net_pos)
+
+    def update_stock_prices(self):
+        mu, sigma = 0.0005, 0.02
+        for comp in companies.values():
+            shock = np.random.normal()
+            comp['stock_price'] *= np.exp(mu - 0.5 * sigma ** 2 + sigma * shock)
+            comp['history'].append(comp['stock_price'])
+            if len(comp['history']) > 365:
+                comp['history'].pop(0)
+
+        self.check_shorts_expiry()
+        self.ai_trade()
+        self.update_charts()
+
+    def save_ai_models(self):
+        combined = {}
+        for ai in self.ai_players:
+            try:
+                ai.save_model()
+                combined[str(ai.idx)] = ai.q_table
+            except Exception as e:
+                print("Error saving AI model:", e)
+        try:
+            with open(SHARED_MODELS_PATH, "w") as f:
+                json.dump(combined, f)
+        except Exception as e:
+            print("Error saving shared AI models:", e)
+
+    def player_buy_action(self):
+        if self.selected_company:
+            amt = self.get_amount()
+            self.trade(self.player, self.selected_company, "buy", amt)
+            self.update_charts()
+
+    def player_sell_action(self):
+        if self.selected_company:
+            amt = self.get_amount()
+            self.trade(self.player, self.selected_company, "sell", amt)
+            self.update_charts()
+
+    def player_short_action(self):
+        if self.selected_company:
+            amt = self.get_amount()
+            self.trade(self.player, self.selected_company, "short", amt)
+            self.update_charts()
+
+    def update_charts(self):
+        if self.selected_company:
+            data = companies[self.selected_company]["history"]
+            self.stock_curve.setData(data)
+            self.stock_plot.setTitle(f"Stock: {self.selected_company}  (price €{companies[self.selected_company]['stock_price']:.2f})")
+        else:
+            self.stock_plot.setTitle("")
+
+        player_overall = self.calc_portfolio_value(self.player)
+        self.player["history"].append(player_overall)
+
+        p_net_pos = self.entity_net_position(self.player, self.selected_company) if self.selected_company else 0.0
+        p_stocks_val = self.entity_stocks_value(self.player)
+        p_reserved = self.player.get("reserved", 0.0)
+        p_overall = player_overall
+
+        self.player_stockpos_history.append(p_net_pos)
+        self.player_stocks_history.append(p_stocks_val)
+        self.player_reserved_history.append(p_reserved)
+        self.player_overall_history.append(p_overall)
+
+        self.player_plot.setTitle("Player: Net pos (shares), Stocks value (€), Reserved (€), Overall (€)")
+        self.player_stockpos_curve.setData(self.player_stockpos_history)
+        self.player_stocks_curve.setData(self.player_stocks_history)
+        self.player_reserved_curve.setData(self.player_reserved_history)
+        self.player_overall_curve.setData(self.player_overall_history)
+
+        for i, (pw, curves) in enumerate(self.ai_curves):
+            ai = self.ai_players[i]
+            curves["stockpos"].setData(ai.stock_position_history)
+            curves["stocks"].setData(ai.stocks_history)
+            curves["reserved"].setData(ai.reserved_history)
+            curves["overall"].setData(ai.history)
+
+        while self.holdings_layout.count():
+            item = self.holdings_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.setParent(None)
+
+        for name, qty in self.player["stocks"].items():
+            price = companies[name]["stock_price"]
+            value = qty * price
+            btn = QtWidgets.QPushButton(f"{name}  ·  Shares: {qty:.4f}  ·  Price: €{price:.2f}  ·  Value: €{value:.2f}")
+            btn.setStyleSheet("text-align:left; padding:6px; color:#E6E6E6; background:#222; border:1px solid #333;")
+            btn.clicked.connect(lambda checked, n=name: self.show_chart(n))
+            self.holdings_layout.addWidget(btn)
+
+        for name, positions in self.player["shorts"].items():
+            for pos in positions:
+                current_price = companies[name]["stock_price"]
+                pnl = (pos['entry_price'] - current_price) * pos['qty']
+                reserved = pos.get("reserved", 0.0)
+                btn = QtWidgets.QPushButton(
+                    f"{name} SHORT  ·  Qty: {pos['qty']:.4f}  ·  Entry: €{pos['entry_price']:.2f}  ·  Current: €{current_price:.2f}  ·  P/L: €{pnl:.2f}  ·  Reserved: €{reserved:.2f}"
+                )
+                btn.setStyleSheet("color: #F88A8A; text-align:left; padding:6px; background:#220000; border:1px solid #440000;")
+                btn.clicked.connect(lambda checked, n=name: self.show_chart(n))
+                self.holdings_layout.addWidget(btn)
+
+        cash_total = self.player["money"]
+        reserved_total = self.player.get("reserved", 0.0)
+        self.cash_label.setText(f"€{cash_total:,.2f}")
+        self.reserved_label.setText(f"€{reserved_total:,.2f}")
 
 
 if __name__ == "__main__":
-    define_stock_market(300)
-    update_overview()
-    update_autofill()
-    update_stock_display()
-    update_stock_prices()
-    root.mainloop()
+    app = QtWidgets.QApplication(sys.argv)
+    window = StockMarketApp()
+    window.show()
+    sys.exit(app.exec_())
